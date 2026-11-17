@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <climits>
 #include <cstdio>
+#include <ctime>
 #include <map>
 #include <set>
 #include <string>
@@ -55,6 +56,8 @@ struct TrayEntry {
     DeviceStatus st;
     int lastPct = -1;        // last known percentage, kept while the device sleeps
     ULONGLONG lastSeen = 0;
+    long long lastSeenUnix = 0;  // wall-clock time of the last real reading (survives restarts)
+    bool restored = false;       // loaded from the registry at startup, not seen since
     bool added = false;
     bool lowWarned = false;
     std::wstring iconSig;    // what the current icon shows, to avoid needless redraws
@@ -161,6 +164,65 @@ bool LoadHideLastKnown() { return LoadBoolSetting(L"HideLastKnownDevices", false
 void SaveHideLastKnown(bool on) { SaveBoolSetting(L"HideLastKnownDevices", on); }
 bool LoadWidgetBackground() { return LoadBoolSetting(L"WidgetBackground", false); }
 void SaveWidgetBackground(bool on) { SaveBoolSetting(L"WidgetBackground", on); }
+
+// Last known levels of devices that sleep (graceSec > 0), so they are shown right after a restart
+// instead of only once they happen to answer a poll. Stored as a REG_MULTI_SZ, one device per
+// string: key \t name \t via \t kind \t percent \t unix time of the last real reading.
+constexpr long long kRememberSec = 3 * 24 * 3600;  // forget a device not seen for this long
+const wchar_t* kLastKnownValue = L"LastKnown";
+std::wstring g_lastKnownSaved;  // what is in the registry now, to skip identical writes
+
+void LoadLastKnown() {
+    DWORD size = 0;
+    if (RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, kLastKnownValue, RRF_RT_REG_MULTI_SZ, nullptr, nullptr, &size) != ERROR_SUCCESS || !size)
+        return;
+    std::vector<wchar_t> buf(size / sizeof(wchar_t) + 1, 0);
+    if (RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, kLastKnownValue, RRF_RT_REG_MULTI_SZ, nullptr, buf.data(), &size) != ERROR_SUCCESS)
+        return;
+    long long now = (long long)time(nullptr);
+    for (const wchar_t* p = buf.data(); *p; p += wcslen(p) + 1) {
+        std::vector<std::wstring> f;
+        std::wstring line = p;
+        for (size_t start = 0;;) {
+            size_t tab = line.find(L'\t', start);
+            f.push_back(line.substr(start, tab == std::wstring::npos ? std::wstring::npos : tab - start));
+            if (tab == std::wstring::npos) break;
+            start = tab + 1;
+        }
+        if (f.size() != 6 || f[0].empty()) continue;
+        int kind = _wtoi(f[3].c_str()), pct = _wtoi(f[4].c_str());
+        long long seen = _wtoi64(f[5].c_str());
+        if (pct < 0 || pct > 100 || kind < 0 || kind > (int)DeviceKind::Phone || now - seen > kRememberSec || seen > now + 60) continue;
+        TrayEntry& e = g_entries[f[0]];
+        e.uid = StableId(f[0]);
+        e.st.key = f[0];
+        e.st.name = f[1];
+        e.st.via = f[2];
+        e.st.kind = (DeviceKind)kind;
+        e.st.percent = -1;
+        e.st.asleep = true;
+        e.st.graceSec = 1800;
+        e.lastPct = pct;
+        e.lastSeenUnix = seen;
+        e.restored = true;
+    }
+}
+
+void SaveLastKnown() {
+    std::wstring multi;
+    for (const auto& [k, e] : g_entries) {
+        if (e.st.graceSec <= 0 || e.lastPct < 0 || !e.lastSeenUnix || !e.st.connected) continue;
+        auto clean = [](std::wstring s) { for (auto& c : s) if (c == L'\t' || c == L'\0') c = L' '; return s; };
+        multi += clean(k) + L"\t" + clean(e.st.name) + L"\t" + clean(e.st.via) + L"\t" + std::to_wstring((int)e.st.kind) + L"\t" +
+                 std::to_wstring(e.lastPct) + L"\t" + std::to_wstring(e.lastSeenUnix);
+        multi.push_back(L'\0');
+    }
+    if (multi == g_lastKnownSaved) return;
+    g_lastKnownSaved = multi;
+    multi.push_back(L'\0');
+    if (multi.size() < 2) multi.push_back(L'\0');  // an empty REG_MULTI_SZ is two terminators
+    RegSetKeyValueW(HKEY_CURRENT_USER, kSettingsKey, kLastKnownValue, REG_MULTI_SZ, multi.data(), (DWORD)(multi.size() * sizeof(wchar_t)));
+}
 
 bool AutostartEnabled() {
     wchar_t buf[MAX_PATH * 2];
@@ -367,7 +429,7 @@ void ApplyEntry(TrayEntry& e) {
         return;
     }
     int shown = s.percent >= 0 ? s.percent : e.lastPct;
-    bool dim = s.percent < 0;
+    bool dim = s.percent < 0 && !s.asleep;  // asleep: last known value, shown at full brightness
     std::wstring sig = std::to_wstring(shown) + (s.charging ? L"c" : L"") + (dim ? L"d" : L"") + (g_lightTaskbar ? L"l" : L"k");
     if (sig != e.iconSig || !e.icon) {
         if (e.icon) DestroyIcon(e.icon);
@@ -432,7 +494,7 @@ void UpdateWidget() {
         it.percent = e->st.percent >= 0 ? e->st.percent : e->lastPct;
         if (e->st.percent >= 0) it.text = e->st.levelText;
         it.charging = e->st.charging;
-        it.dim = e->st.percent < 0;
+        it.dim = e->st.percent < 0 && !e->st.asleep;  // asleep: last known value, shown at full brightness
         it.low = !it.charging && it.percent >= 0 && it.percent <= LOW_BATTERY;
         it.bluetooth = e->st.via == L"Bluetooth";
         items.push_back(it);
@@ -449,16 +511,23 @@ void OnResults(std::vector<DeviceStatus>& results) {
         auto& e = g_entries[s.key];
         if (!e.uid) e.uid = StableId(s.key);
         e.st = s;
-        if (s.percent >= 0) e.lastPct = s.percent;
+        if (s.percent >= 0) {
+            e.lastPct = s.percent;
+            e.lastSeenUnix = (long long)time(nullptr);
+        }
         e.lastSeen = GetTickCount64();
+        e.restored = false;
         seen[s.key] = true;
         ApplyEntry(e);
     }
+    long long now = (long long)time(nullptr);
     for (auto it = g_entries.begin(); it != g_entries.end();) {
         auto& e = it->second;
         // Some receivers drop sleeping devices from the link; keep showing the last value for a while.
+        // A device remembered from before a restart stays until it answers again or gets too old.
         bool inGrace = !seen.count(it->first) && e.st.graceSec > 0 && e.st.connected &&
-                       GetTickCount64() - e.lastSeen < (ULONGLONG)e.st.graceSec * 1000;
+                       (e.restored ? now - e.lastSeenUnix < kRememberSec
+                                   : GetTickCount64() - e.lastSeen < (ULONGLONG)e.st.graceSec * 1000);
         if (inGrace) {
             e.st.percent = -1;
             e.st.asleep = true;
@@ -472,6 +541,7 @@ void OnResults(std::vector<DeviceStatus>& results) {
             ++it;
         }
     }
+    SaveLastKnown();
     UpdatePlaceholder();
     UpdateWidget();
 }
@@ -802,7 +872,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     widget::SetBackground(g_widgetBackground);  // remembered by the widget across re-creation
     LoadHidden();
     LoadOrder();
+    LoadLastKnown();
     Reconcile();
+    for (auto& [k, e] : g_entries) ApplyEntry(e);  // remembered devices, until the first poll finishes
+    UpdateWidget();
     UpdatePlaceholder();  // something to click on until the first poll finishes
     SetTimer(g_hwnd, TIMER_WIDGET, 1000, nullptr);
     g_worker = CreateThread(nullptr, 0, Worker, nullptr, 0, nullptr);
